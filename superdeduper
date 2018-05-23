@@ -1,0 +1,309 @@
+#!/bin/env python
+#
+# Find duplicate or redundant data under the given directory.  This program
+# identifies files that have either identical contents or names that suggest
+# they are the same data with different packaging (encryption or compression).
+#
+# This program only reports duplicate or potentially duplicate files.  No data
+# is actually removed, although that may be added as an option in the future.
+#
+import argparse
+import errno
+import hashlib
+import os
+import pdb
+import signal
+import stat
+import subprocess
+import sys
+
+ME = "superdeduper"
+VERSION = "v1.0.0"
+MAX_STATUS_LEN = int(subprocess.check_output(['stty','size']).split()[1]) - 1
+CLR_TO_EOL = "[0K"
+
+# Don't bother with files smaller than this size by default (may be changed
+# with command line option).  Set to 0 if it's important to conserve inodes as
+# well, not just disk space.
+MIN_SIZE = 1024 * 1024 * 50 # 50 MiB
+
+# Some files contains duplicate data, just compressed and encrypted.  These
+# are just flagged for the user to check for now.
+EXTENSIONS = (
+    ".pgp", ".gpg", ".aes",                     # encrypted
+    ".tar",                                     # archived without compression
+    ".gz", ".tar.gz", ".tgz",                   # compressed with gzip
+    ".xz", ".lzma", ".tar.xz", ".txz", ".tlz",  # compressed with xz
+    ".bz2", ".bz", ".tar.bz2", ".tbz2", ".tbz", # compressed with bzip2
+)
+
+# Do not descend down these directories.
+IGNORE_DIRS = (".svn", ".git", ".snapshot")
+
+# These maps are used to track duplicate (or potentially duplicate) files.  The
+# hashes are MD5 digests (they're much faster than SHA-256 and we're not
+# worried about attacks). The SHASH is a digest of *just the start* (first
+# megabyte) of the file, while the HASH is the digest of the full file.
+SIZE = {
+    # size => [ files of that size ]
+}
+SHASH = {
+    # shash => first file with that shash
+}
+HASH = {
+    # hash => [ files with that hash ]
+}
+
+# Total size of duplicate (or potentially duplicate) data.
+DUPSIZ = 0
+
+#==============================================================================
+# SUBROUTINES
+#==============================================================================
+
+def SignalHandler(signal, fram):
+    print
+    if DUPSIZ > 0:
+        print "<Ctr-C>: Incomplete duplicate data size:" + SizeSfx(DUPSIZ)
+    sys.exit(1)
+
+def SizeStr(size):
+    if size < 1024 * 1024:
+        str = "{0:3.1f} KiB".format(size / 1024.0)
+    elif size < 1024 * 1024 * 1024:
+        str = "{0:3.1f} MiB".format(size / 1024.0 / 1024.0)
+    else:
+        str = "{0:3.1f} GiB".format(size / 1024.0 / 1024.0 / 1024.0)
+
+    return str
+
+def SizeSfx(size):
+    return ' (' + SizeStr(size) + ')'
+
+# refresh last line of display (via stderr)
+def UpdateStatus(msg):
+    if (len(msg) < MAX_STATUS_LEN):
+        status = msg + CLR_TO_EOL
+    else:
+        w = MAX_STATUS_LEN / 2 - 1
+        status = msg[:w] + '...' + msg[-w:]
+    sys.stderr.write("\r" + status)
+
+# erase status list of display (via stderr)
+def ClearStatus():
+    UpdateStatus('')
+
+# get digest of start (first megabyte) of file
+def FileStartDigest(pathname):
+    md5 = hashlib.md5()
+    file = open(pathname)
+    md5.update(file.read(1024 * 1024))
+
+    return md5.hexdigest()
+
+# get digest of entire file
+def FileDigest(pathname):
+    size = os.lstat(pathname).st_size
+
+    msg = "MD5: " + pathname + SizeSfx(size)
+    UpdateStatus(msg + ' ')
+
+    if MAX_STATUS_LEN - len(msg) > 0:
+        update_every = size / (MAX_STATUS_LEN - len(msg))
+    else:
+        update_every = 0
+
+    md5 = hashlib.md5()
+    file = open(pathname)
+
+    data = file.read(1024 * 1024)
+    bytes_read = len(data)
+    while data:
+        if update_every > 0 and bytes_read >= update_every:
+            sys.stderr.write('.')
+            bytes_read = bytes_read % update_every
+
+        md5.update(data)
+        data = file.read(1024 * 1024)
+        bytes_read += len(data)
+
+    UpdateStatus(msg)
+
+    return md5.hexdigest()
+
+# determine if file is duplicate of one already seen
+def IsDuplicateFile(path):
+    global SIZE, SHASH, HASH
+
+    sz = os.lstat(path).st_size
+    rv = False
+
+    if sz not in SIZE:
+        # unique size means not a duplicate
+        SIZE[sz] = [ path ]
+    else:
+        if len(SIZE[sz]) == 1:
+            first_file = SIZE[sz][0]
+
+            h = FileStartDigest(first_file)
+            SHASH[h] = first_file
+
+            h = FileDigest(first_file)
+            HASH[h] = [ first_file ]
+
+        # most files that are different will differ from the start,
+        # so only hash the entire file if their start hashes are the same
+
+        SIZE[sz].append(path)
+        h = FileStartDigest(path)
+        if h not in SHASH:
+            SHASH[h] = path
+        else:
+            h = FileDigest(path)
+            if h not in HASH:
+                HASH[h] = [ path ]
+            else:
+                rv = True
+
+    return rv
+
+# return size of files contained in directory and subdirectories
+def DirectorySize(dirpath):
+    size = 0
+    for path, names, files in os.walk(dirpath):
+        for f in files:
+            p = os.path.join(path, f)
+            size += os.path.getsize(p)
+    return size
+
+# find duplicates and potential duplicates in directory and subdirectories
+def ProcessDir(dirpath):
+    global SIZE, DUPSIZ
+    entries = { }
+
+    UpdateStatus(dirpath)
+    try:
+        entries = os.listdir(dirpath)
+    except OSError as e:
+        if e.errno != errno.EACCES:
+            raise
+    if not entries:
+        return
+
+    # check files in current directory
+    entries.sort(key=len, reverse=True)
+    for e in entries:
+        p = dirpath + '/' + e
+        UpdateStatus(p)
+        s = os.lstat(p)
+
+        if stat.S_ISREG(s.st_mode) and s.st_size > MIN_SIZE:
+            name, ext = os.path.splitext(e)
+            first = True
+
+            while ext != '':
+                if ext[:5] == ".aes-":
+                    ext = ".aes"
+
+                if ext in EXTENSIONS:
+                    try:
+                        s2 = os.lstat(dirpath + '/' + name)
+
+                        if stat.S_ISDIR(s2.st_mode):
+                            dir_size = DirectorySize(dirpath + '/' + name)
+                        else:
+                            dir_size = 0
+
+                        if stat.S_ISREG(s2.st_mode) and s.st_size >= s2.st_size:
+                            ClearStatus()
+                            if first:
+                                print "EXT: " + p + SizeSfx(s.st_size)
+                                first = False
+                            print " --> "+dirpath+'/'+name+SizeSfx(s2.st_size)
+                            DUPSIZ += s2.st_size
+                            entries.remove(name)
+                        elif dir_size > s.st_size:
+                            ClearStatus()
+                            if first:
+                                print "EXT: " + p + SizeSfx(s.st_size)
+                                first = False
+                            dir_size = DirectorySize(dirpath + '/' + name)
+                            print " --> " + dirpath + '/' + name + '/' + \
+                                         SizeSfx(dir_size)
+                            DUPSIZ += dir_size
+                            entries.remove(name)
+                    except:
+                        pass
+
+                name, ext = os.path.splitext(name)
+
+        if stat.S_ISREG(s.st_mode) and s.st_size > MIN_SIZE:
+            if IsDuplicateFile(p):
+                ClearStatus()
+                print "DUP: " + p + SizeSfx(s.st_size)
+                print " --> " + SIZE[s.st_size][0]
+                DUPSIZ += s.st_size
+
+    # check subdirectories
+    for e in entries:
+        p = dirpath + '/' + e
+        if stat.S_ISDIR(os.lstat(p).st_mode):
+            if e not in IGNORE_DIRS:
+                ProcessDir(p)
+
+#==============================================================================
+# MAIN
+#==============================================================================
+
+parser = argparse.ArgumentParser(
+    description="Look for duplicate and potentially duplicate files " + \
+                "under the given path."
+)
+parser.add_argument(
+    'directory',
+    type=str,
+    nargs='?',
+    help="directory to check"
+)
+parser.add_argument(
+    "--version", "-v",
+    action='store_true',
+    help="output the version number"
+)
+parser.add_argument(
+    '--min-size', "-s",
+    type=float,
+    metavar="MiBs",
+    help="don't bother with files smaller than this (default: " \
+         + SizeStr(MIN_SIZE) + ")"
+)
+
+args = parser.parse_args()
+
+if args.version:
+    print VERSION
+    sys.exit(0)
+
+if args.min_size:
+    MIN_SIZE = args.min_size * 1024 * 1024;
+
+if not args.directory:
+    print >>sys.stderr, ME + ": no directory specified"
+    sys.exit(1)
+
+# install Ctrl-C signal handler to output partial report before exiting
+signal.signal(signal.SIGINT, SignalHandler)
+
+ProcessDir(args.directory)
+
+ClearStatus()
+
+if DUPSIZ == 0:
+    print ME + ": no duplicate or potentially duplicate files found"
+else:
+    print "DONE: Duplicate (or potentially duplicate) data size is " \
+          + SizeStr(DUPSIZ)
+
+sys.exit(0)
+
+# eof
